@@ -1,0 +1,416 @@
+---
+title: "Home Credit Modeling — Final Notebook (R Executed, Python Shown but Not Run)"
+author: "Miles McCunniff, Sina Odejinmi, Sebastian Perez Parra"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+**Business goal:** Predict loan default probability (TARGET = 1) to improve credit decisioning.\
+**Primary metric:** AUC (target mid-0.70s+).\
+**Important:** This is an **R-executed** notebook. Python code is **included for documentation** but **not executed** (chunks use `eval: false`).
+
+------------------------------------------------------------------------
+
+# Setup (R)
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(pROC)
+library(recipes)
+library(themis)
+library(xgboost)
+library(Matrix)
+set.seed(42)
+```
+
+------------------------------------------------------------------------
+
+# 0.1 (Attempted) Reticulate / Python Environment Setup — not executed
+
+> We attempted to configure a Python environment from within R using **reticulate**. On this machine, creating/locating a conda/miniconda binary failed. We keep the code here (not executed) to document the attempt.
+
+```{r}
+#| eval: false
+# Reticulate / Python setup (attempt)
+library(reticulate)
+
+env <- "r-reticulate"
+
+if (is.null(reticulate::conda_binary())) {
+  reticulate::install_miniconda()
+}
+if (!(env %in% reticulate::conda_list()$name)) {
+  reticulate::conda_create(env)
+}
+reticulate::use_condaenv(env, required = TRUE)
+
+reticulate::conda_install(envname = env, packages = c("python=3.10","numpy","pandas","scikit-learn"), channel = "conda-forge")
+try(reticulate::conda_install(envname = env, packages = "xgboost", channel = "conda-forge"), silent = TRUE)
+if (!py_module_available("xgboost")) {
+  reticulate::py_install("xgboost", envname = env, pip = TRUE)
+}
+
+reticulate::py_config()
+```
+
+```{python}
+#| eval: false
+# Sanity check (kept for reproducibility if env becomes available)
+import sys, numpy as np, pandas as pd, sklearn, xgboost
+sys.version, np.__version__, pd.__version__, sklearn.__version__, xgboost.__version__
+```
+
+------------------------------------------------------------------------
+
+# 1 Load & Split Data (R)
+
+```{r}
+raw_train <- fread("application_train.csv")
+
+# Stratified 80/20 split
+in_idx <- createDataPartition(raw_train$TARGET, p = 0.8, list = FALSE)
+train_df <- raw_train[in_idx]
+valid_df <- raw_train[-in_idx]
+
+prop.table(table(train_df$TARGET))
+prop.table(table(valid_df$TARGET))
+```
+
+------------------------------------------------------------------------
+
+# 2 Feature Engineering — Missingness Indicators (R)
+
+```{r}
+add_missing_flags <- function(dt) {
+  dt %>% mutate(
+    M_EXT_SOURCE_1 = ifelse(is.na(EXT_SOURCE_1), 1L, 0L),
+    M_EXT_SOURCE_2 = ifelse(is.na(EXT_SOURCE_2), 1L, 0L),
+    M_EXT_SOURCE_3 = ifelse(is.na(EXT_SOURCE_3), 1L, 0L),
+    M_HOUSING_INFO = ifelse(is.na(COMMONAREA_AVG), 1L, 0L)
+  )
+}
+train_df <- add_missing_flags(train_df)
+valid_df <- add_missing_flags(valid_df)
+```
+
+Simple imputation for GLMs:
+
+```{r}
+impute_simple <- function(dt) {
+  for (nm in names(dt)) {
+    if (anyNA(dt[[nm]])) {
+      if (is.numeric(dt[[nm]])) {
+        dt[[nm]][is.na(dt[[nm]])] <- median(dt[[nm]], na.rm = TRUE)
+      } else {
+        mode_val <- names(sort(table(dt[[nm]]), decreasing = TRUE))[1]
+        dt[[nm]][is.na(dt[[nm]])] <- mode_val
+      }
+    }
+  }
+  dt
+}
+train_imp <- impute_simple(train_df)
+valid_imp <- impute_simple(valid_df)
+```
+
+------------------------------------------------------------------------
+
+# 3 Modeling (R)
+
+```{r}
+# Factor outcome for caret ROC
+train_imp$TARGET_F <- factor(ifelse(train_imp$TARGET == 1, "Yes", "No"), levels = c("No","Yes"))
+valid_imp$TARGET_F <- factor(ifelse(valid_imp$TARGET == 1, "Yes", "No"), levels = c("No","Yes"))
+
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+predictors <- c(
+  "AMT_INCOME_TOTAL","AMT_CREDIT","DAYS_EMPLOYED",
+  "EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3",
+  "AMT_ANNUITY","AMT_GOODS_PRICE","REGION_RATING_CLIENT",
+  "FLAG_OWN_CAR","FLAG_OWN_REALTY","NAME_EDUCATION_TYPE",
+  "M_EXT_SOURCE_1","M_EXT_SOURCE_2","M_EXT_SOURCE_3","M_HOUSING_INFO"
+)
+core_formula_cls <- reformulate(predictors, response = "TARGET_F")
+```
+
+## 3.1 Logistic Regression (R, caret CV)
+
+```{r}
+glm_fit <- train(core_formula_cls, data = train_imp, method = "glm", metric = "ROC", trControl = ctrl)
+glm_pred <- predict(glm_fit, newdata = valid_imp, type = "prob")[, "Yes"]
+auc_glm <- pROC::auc(valid_imp$TARGET, glm_pred)
+auc_glm
+```
+
+The logistic regression baseline achieved an AUC around 0.73, showing meaningful separation between defaulters and non-defaulters but leaving room for improvement. External credit scores (EXT_SOURCE\_\*) were the dominant predictors, confirming their critical role in assessing borrower reliability.
+
+## 3.2 XGBoost (R, fast caret grid)
+
+```{r}
+xgb_grid_small <- expand.grid(
+  nrounds = 120,
+  max_depth = 4,
+  eta = 0.10,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+ctrl_fast <- trainControl(method = "cv", number = 3, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+xgb_fit <- train(core_formula_cls, data = train_imp, method = "xgbTree",
+                 trControl = ctrl_fast, tuneGrid = xgb_grid_small,
+                 metric = "ROC", verbose = FALSE)
+xgb_pred <- predict(xgb_fit, newdata = valid_imp, type = "prob")[, "Yes"]
+auc_xgb32 <- pROC::auc(valid_imp$TARGET, xgb_pred); auc_xgb32
+```
+
+The XGBoost model with a small caret grid improved performance to roughly 0.748 AUC, outperforming logistic regression and highlighting the value of nonlinear relationships and interactions. This indicates borrower behavior patterns that linear models may not fully capture.
+
+## 3.3 XGBoost (R, class weights + early stopping)
+
+```{r}
+y_tr <- ifelse(train_imp$TARGET_F == "Yes", 1L, 0L)
+y_va <- valid_imp$TARGET
+
+X_tr <- model.matrix(reformulate(predictors), data = train_imp)[, -1]
+X_va <- model.matrix(reformulate(predictors), data = valid_imp)[, -1]
+
+dtrain <- xgb.DMatrix(data = X_tr, label = y_tr)
+dvalid <- xgb.DMatrix(data = X_va, label = y_va)
+
+neg <- sum(y_tr == 0L); pos <- sum(y_tr == 1L); spw <- neg / pos
+
+params_wt <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.08,
+  max_depth = 4,
+  subsample = 0.85,
+  colsample_bytree = 0.85,
+  tree_method = "hist",
+  scale_pos_weight = spw
+)
+
+xgb_wt <- xgb.train(params = params_wt, data = dtrain, nrounds = 1000,
+                    watchlist = list(valid = dvalid), early_stopping_rounds = 30, verbose = 0)
+
+pred_wt <- predict(xgb_wt, dvalid)
+auc_xgb33 <- pROC::auc(y_va, pred_wt)
+cat("XGB (class-weighted) AUC:", round(auc_xgb33, 4), "| Best iters:", xgb_wt$best_iteration, "\n")
+```
+
+The class-weighted XGBoost model performed slightly better (0.749 AUC), confirming that accounting for the imbalanced default class improves sensitivity without sacrificing stability. It serves as a strong, scalable candidate for real-world deployment.
+
+------------------------------------------------------------------------
+
+# 4 R-Only Ensemble + Sina's Reported Results
+
+## 4.1 R-Only Ensemble (avg of §3.2 and §3.3)
+
+```{r}
+stopifnot(exists("xgb_pred"), exists("pred_wt"))
+pred_ens_r <- (xgb_pred + pred_wt) / 2
+auc_ens_r  <- pROC::auc(valid_imp$TARGET, pred_ens_r)
+data.frame(Model = c("3.2 caret XGB (fast grid)", "3.3 class-weighted XGB", "R-only Ensemble (avg)"),
+           AUC   = c(as.numeric(auc_xgb32), as.numeric(auc_xgb33), as.numeric(auc_ens_r)))
+```
+
+Averaging predictions from both XGBoost variants produced the highest AUC (0.750). This modest yet consistent gain shows that even simple ensembling can capture complementary model strengths and boost robustness.
+
+## 4.2 Sina's Python Results (reported; not executed here)
+
+```{r}
+sina_results <- tibble::tribble(
+  ~Model, ~Accuracy, ~AUC,
+  "Logistic (numeric-only)",         0.919272, 0.737980,
+  "Logistic (numeric + categorical)",0.919386, 0.750191,
+  "Logistic (targeted interactions)",0.919370, 0.750895,
+  "Random Forest (Python)",          0.919272, 0.742343,
+  "Gradient Boosting (Python)",      0.919760, 0.758034
+)
+sina_results
+```
+
+------------------------------------------------------------------------
+
+# 5 Combined Model Comparison (R executed + Sina reported)
+
+```{r}
+library(knitr)
+
+r_only <- tibble::tibble(
+  Model = c("Majority Class (baseline)",
+            "Logistic Regression (R)",
+            "XGBoost (R, fast grid)",
+            "XGBoost (R, class-weighted)",
+            "R-only Ensemble (avg)"),
+  AUC   = c(0.5000,
+            as.numeric(auc_glm),
+            as.numeric(auc_xgb32),
+            as.numeric(auc_xgb33),
+            as.numeric(auc_ens_r))
+)
+
+combined <- rbind(r_only, dplyr::select(sina_results, Model, AUC)) %>%
+  arrange(desc(AUC))
+
+knitr::kable(combined, digits = 3,
+  caption = "Combined model performance (R models executed; Sina's Python models reported).")
+```
+
+Across all approaches, the ensemble and Sina’s Gradient Boosting model both achieved AUC values in the mid-0.75 range. Logistic regression provided interpretability, while boosted tree models delivered measurable predictive improvement.
+
+------------------------------------------------------------------------
+
+# 6 Discussion / Business Notes
+
+Our modeling results show clear potential to improve Home Credit’s loan risk management and decision-making accuracy.
+
+Key drivers: External credit scores (EXT_SOURCE\_\*) and job stability (DAYS_EMPLOYED) were the strongest predictors of default, aligning with real-world lending logic. Borrowers with weaker credit scores or shorter employment histories present higher repayment risk.
+
+Missing-value indicators: Treating missing credit score data as its own category improved accuracy, suggesting that applicants with limited information form a distinct, higher-risk segment worth separate monitoring.
+
+Model results: The top-performing R ensemble reached an AUC near 0.75, closely aligning with Sina’s Gradient Boosting results. This consistency across tools reinforces model reliability.
+
+Interpretability vs. performance: Logistic regression provided transparency for explaining lending decisions, while XGBoost models offered superior predictive power. A blended approach could satisfy both regulatory and operational needs.
+
+Business takeaway: Even small AUC gains can yield significant financial benefits by better ranking borrower risk, allowing more confident approvals and fewer defaults.
+
+Overall, these findings confirm that ensemble-based modeling can meaningfully support Home Credit’s mission of expanding access to credit while maintaining sustainable portfolio quality.
+
+Our final ensemble submission (HomeCredit_submission.csv) produced a **Kaggle AUC score** of 0.73399 (public leaderboard) and 0.73308 (private leaderboard). (see Appendix B for creation of our submission file)
+
+## Group Member Contributions
+
+-   **Miles McCunniff** — R modeling pipeline (logistic, XGBoost, ensemble), feature engineering, Kaggle submission, and notebook assembly.
+-   **Sina Odejinmi** — Python modeling (logistic with categorical & interactions, gradient boosting), comparative results, and editorial review.
+-   **Sebastian Perez Parra** — R modeling pipeline (logistic, XGBoost, ensemble), Random Forest variants, hyperparameter tests, and editorial review.
+
+------------------------------------------------------------------------
+
+# Appendix A — Python Pipelines (kept for reproducibility; not executed)
+
+## A.1 Python setup (scikit-learn / XGBoost)
+
+```{python}
+#| eval: false
+import os, sys, json, math, warnings
+warnings.filterwarnings("ignore")
+import numpy as np, pandas as pd
+from sklearn.model_selection import StratifiedKFold, train_test_split, GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+RANDOM_STATE = 42
+```
+
+## A.2 Shared split load (Python)
+
+```{python}
+#| eval: false
+# If splits are exported from R, load them as below. Documented here only.
+import pandas as pd
+train_df = pd.read_csv("split_train.csv")
+valid_df = pd.read_csv("split_valid.csv")
+
+for col in ["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"]:
+    train_df[f"M_{col}"] = train_df[col].isna().astype(int)
+    valid_df[f"M_{col}"] = valid_df[col].isna().astype(int)
+train_df["M_HOUSING_INFO"] = train_df["COMMONAREA_AVG"].isna().astype(int)
+valid_df["M_HOUSING_INFO"] = valid_df["COMMONAREA_AVG"].isna().astype(int)
+
+target = "TARGET"
+features = [
+    "AMT_INCOME_TOTAL","AMT_CREDIT","DAYS_EMPLOYED",
+    "EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3",
+    "AMT_ANNUITY","AMT_GOODS_PRICE","REGION_RATING_CLIENT",
+    "FLAG_OWN_CAR","FLAG_OWN_REALTY","NAME_EDUCATION_TYPE",
+    "M_EXT_SOURCE_1","M_EXT_SOURCE_2","M_EXT_SOURCE_3","M_HOUSING_INFO"
+]
+X_tr, y_tr = train_df[features].copy(), train_df[target].values
+X_va, y_va = valid_df[features].copy(), valid_df[target].values
+
+num_cols = X_tr.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = [c for c in X_tr.columns if c not in num_cols]
+```
+
+## A.3 Python models (not executed)
+
+```{python}
+#| eval: false
+num_pipe = Pipeline([("impute", SimpleImputer(strategy="median")),
+                     ("scale", StandardScaler(with_mean=False))])
+cat_pipe = Pipeline([("impute", SimpleImputer(strategy="most_frequent")),
+                     ("onehot", OneHotEncoder(handle_unknown="ignore"))])
+pre = ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
+
+logit = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=200, class_weight="balanced"))])
+logit.fit(X_tr, y_tr)
+auc_logit_py = roc_auc_score(y_va, logit.predict_proba(X_va)[:,1])
+
+rf = Pipeline([("pre", pre),
+              ("clf", RandomForestClassifier(n_estimators=400, min_samples_leaf=50,
+                                             n_jobs=-1, random_state=RANDOM_STATE,
+                                             class_weight="balanced_subsample"))])
+rf.fit(X_tr, y_tr)
+auc_rf = roc_auc_score(y_va, rf.predict_proba(X_va)[:,1])
+
+xgb = Pipeline([("pre", pre),
+                ("clf", XGBClassifier(n_estimators=350, max_depth=6, learning_rate=0.08,
+                                      subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+                                      eval_metric="auc", random_state=RANDOM_STATE, n_jobs=-1,
+                                      tree_method="hist"))])
+xgb.fit(X_tr, y_tr)
+auc_xgb_py = roc_auc_score(y_va, xgb.predict_proba(X_va)[:,1])
+auc_logit_py, auc_rf, auc_xgb_py
+```
+
+# Appendix B - Kaggle Submission
+
+```{r}
+# 7) Kaggle Submission
+
+# Load test data
+test_df <- fread("application_test.csv")
+
+# Apply same feature engineering
+test_df <- add_missing_flags(test_df)
+test_imp <- impute_simple(test_df)
+
+# Match predictor columns
+X_test <- model.matrix(reformulate(predictors), data = test_imp)[, -1]
+dtest <- xgb.DMatrix(data = X_test)
+
+# Use best model (ensemble of fast XGB and class-weighted XGB)
+pred_test_fast <- predict(xgb_fit, newdata = test_imp, type = "prob")[, "Yes"]
+pred_test_weighted <- predict(xgb_wt, dtest)
+pred_test_final <- (pred_test_fast + pred_test_weighted) / 2
+
+# Create submission file
+submission <- fread("sample_submission.csv")
+submission$TARGET <- pred_test_final
+fwrite(submission, "HomeCredit_submission.csv")
+
+cat("Kaggle submission file written: HomeCredit_submission.csv\n")
+```

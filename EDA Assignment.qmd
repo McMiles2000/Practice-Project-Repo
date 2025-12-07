@@ -1,0 +1,417 @@
+---
+title: "EDA Assignment"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Business & Analytic Problem Statement
+
+Home Credit is a financial institution that provides loans to clients who are often under served by traditional banks. The business challenge is to extend credit responsibly while minimizing the risk of default. If clients are misclassified as creditworthy when they are likely to default, the company faces significant financial losses. On the other hand, overly conservative models that reject potentially good clients may prevent business growth.
+
+The analytic problem is therefore to predict TARGET, a binary variable where 0 indicates the loan was repaid on time and 1 indicates the loan resulted in default.
+
+The objective of this project is to explore the data to understand which factors are most associated with default and to identify data quality issues that must be addressed prior to modeling. This phase of the CRISP-DM process, data understanding and data preparation, is critical because it provides insights into the distributions, relationships, and potential predictive power of the available features.
+
+# Guiding Questions
+
+[Target Variable:]{.underline}
+
+-   What is the distribution of the target (TARGET)?
+
+-   Is the dataset imbalanced, and what accuracy would a simple majority-class classifier achieve?
+
+[Predictor Relationships:]{.underline}
+
+-   Which numeric variables differ most between repaid and defaulted loans?
+
+-   Do categorical features (for example, education, occupation, contract type) show distinct default rates?
+
+-   Are there variables that appear particularly strong candidates for predictive modeling?
+
+[Feature Exploration (AI vs. Human):]{.underline}
+
+-   Which features does an AI assistant identify as most predictive, based only on semantic meaning?
+
+-   Which features show the strongest statistical relationship with the target variable?
+
+-   How much overlap exists between the AI-informed and data-informed feature lists?
+
+[Missing Data:]{.underline}
+
+-   Which variables contain missing values, and at what magnitude?
+
+-   Should missing values be handled through removal (rows or columns) or imputation?
+
+-   Are there features where missingness itself may carry predictive information?
+
+[Data Quality Issues:]{.underline}
+
+-   Are there implausible or placeholder values (for example, DAYS_EMPLOYED = 365243) that require correction?
+
+-   Are there categorical levels with too few observations?
+
+-   Are there features with near-zero or zero variance that should be dropped?
+
+[Transformations and Encoding:]{.underline}
+
+-   Which variables may require scaling or log transformation?
+
+-   Which categorical features need to be converted to factors or dummy variables, depending on model choice?
+
+[Transactional Data:]{.underline}
+
+-   What insights can be gained by joining application data with transactional datasets (for example, bureau.csv, previous_application.csv)?
+
+-   After aggregation to the client level, do transactional features (such as number of active loans or overdue days) appear predictive of default?
+
+# Data Setup & Preview
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(data.table)
+
+# Load the training dataset
+app_train <- fread("application_train.csv")
+
+# Load the test dataset (no TARGET column here)
+app_test <- fread("application_test.csv")
+
+# Preview the structure of the training data
+dim(app_train)
+names(app_train)[1:20]
+str(app_train, list.len = 10)
+head(app_train, 5)
+
+# Summary of the target variable (0 = paid, 1 = default)
+table(app_train$TARGET)
+prop.table(table(app_train$TARGET))
+
+```
+
+# Description of the Data
+
+The training dataset `application_train.csv` contains 307,511 rows and 122 columns, with each row representing a loan application. The target variable is `TARGET` (0 = repaid, 1 = default). Features include numeric variables such as income, loan amount, annuity, and age (in days), as well as categorical variables such as contract type, gender, occupation, education, and family status. Binary flags indicate asset ownership (for example, car or real estate). The test dataset has the same structure without the target column, and additional transactional data (such as `bureau.csv`) can be aggregated and joined for feature enrichment.
+
+# Target Variable Exploration
+
+```{r}
+# Explore the target variable distribution
+target_dist <- table(app_train$TARGET)
+target_prop <- prop.table(target_dist)
+
+# Show counts and proportions
+target_dist
+target_prop
+
+# Visualize the class imbalance
+ggplot(app_train, aes(x = factor(TARGET))) +
+  geom_bar(fill = c("#1f77b4", "#ff7f0e")) +
+  labs(
+    title = "Distribution of Target Variable",
+    x = "TARGET (0 = Repaid, 1 = Defaulted)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# Calculate majority class baseline accuracy
+majority_class <- max(target_prop)
+majority_class
+```
+
+This barplot shows the distribution of the target variable. The majority of loans are repaid (TARGET = 0), while only a small fraction default (TARGET = 1). This confirms the dataset is highly imbalanced, with defaults making up less than 10% of the data.
+
+# Target & Predictor Relationship
+
+```{r}
+# Distribution of AMT_CREDIT by TARGET
+ggplot(app_train, aes(x = TARGET, y = AMT_CREDIT, fill = factor(TARGET))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_continuous(labels = scales::comma, limits = c(0, quantile(app_train$AMT_CREDIT, 0.95))) +
+  labs(
+    title = "Loan Amount (AMT_CREDIT) by Target",
+    x = "TARGET (0 = Repaid, 1 = Defaulted)",
+    y = "Loan Amount"
+  ) +
+  theme_minimal()
+
+# Distribution of AMT_INCOME_TOTAL by TARGET
+ggplot(app_train, aes(x = TARGET, y = AMT_INCOME_TOTAL, fill = factor(TARGET))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_continuous(labels = scales::comma, limits = c(0, quantile(app_train$AMT_INCOME_TOTAL, 0.95))) +
+  labs(
+    title = "Client Income (AMT_INCOME_TOTAL) by Target",
+    x = "TARGET (0 = Repaid, 1 = Defaulted)",
+    y = "Income"
+  ) +
+  theme_minimal()
+```
+
+Borrowers who defaulted tend to have slightly larger loan amounts compared to those who repaid. While the difference is not dramatic, higher loan sizes appear to add some repayment risk.
+
+Defaulting clients generally have lower total income than clients who repaid. This supports the idea that income level is strongly tied to repayment capacity.
+
+# Feature Exploration: AI vs. Human
+
+## [Prompt:]{.underline}
+
+Here are the column names and descriptions from the Home Credit Default Risk data dictionary. Act as a credit risk analyst and identify the top 15–20 variables you believe would be most predictive of loan default (TARGET = 1). Base your choices only on the semantic meaning of the variables, not on statistical analysis. Please explain your reasoning for why each variable may be predictive.
+
+## [AI Response:]{.underline}
+
+Here’s a credit risk analyst’s perspective on the **top 15–20 most predictive variables for loan default (TARGET=1)**, based only on their semantic meaning in the Home Credit Default Risk dataset.
+
+**1. AMT_INCOME_TOTAL (Client’s total income)**
+
+**Why predictive:** Borrowers with lower income relative to loan size are more likely to struggle with repayments. Income is one of the strongest capacity indicators.
+
+**2. AMT_CREDIT (Credit amount requested)**
+
+**Why predictive:** Larger loan amounts increase repayment burden. Risk grows when loan size is high compared to income.
+
+**3. AMT_ANNUITY (Loan annuity – installment amount)**
+
+**Why predictive:** High monthly payments relative to income increase probability of default. This directly affects affordability.
+
+**4. AMT_GOODS_PRICE (Price of goods financed)**
+
+**Why predictive:** Provides context for collateral or financed purchase. Large ticket items may signal higher risk, especially if goods depreciate.
+
+**5. CNT_CHILDREN (Number of children)**
+
+**Why predictive:** More dependents strain household finances, reducing ability to service debt.
+
+**6. DAYS_BIRTH (Age of client, in days)**
+
+**Why predictive:** Age often correlates with financial stability. Very young or very old clients may have higher default risk.
+
+**7. DAYS_EMPLOYED (Days employed before application)**
+
+**Why predictive:** Short employment histories may indicate unstable income. Long unemployment spells are high risk.
+
+**8. NAME_INCOME_TYPE (Type of income – working, pensioner, etc.)**
+
+**Why predictive:** Employment type impacts income stability. Pensioners and contract workers may be higher risk than salaried employees.
+
+**9. NAME_EDUCATION_TYPE (Education level)**
+
+**Why predictive:** Higher education correlates with better job stability and income potential, lowering default probability.
+
+**10. NAME_FAMILY_STATUS (Marital status)**
+
+**Why predictive:** Single or divorced applicants may have less financial support and higher vulnerability to shocks.
+
+**11. NAME_HOUSING_TYPE (Housing situation – rent, mortgage, own)**
+
+**Why predictive:** Renters often face higher monthly expenses and less asset security than homeowners.
+
+**12. FLAG_OWN_REALTY (Owns house/flat)**
+
+**Why predictive:** Owning property indicates asset backing and stability, reducing risk.
+
+**13. FLAG_OWN_CAR (Owns car)**
+
+**Why predictive:** Car ownership can signal higher expenses, but also financial capacity. Lack of assets might increase vulnerability.
+
+**14. DAYS_REGISTRATION (How long ago client registered residence)**
+
+**Why predictive:** Short residence history may indicate instability or high mobility, which correlates with repayment risk.
+
+**15. DAYS_ID_PUBLISH (How long ago ID was changed)**
+
+**Why predictive:** Recent ID changes may flag potential fraud or instability, linked to higher default rates.
+
+**16. REGION_POPULATION_RELATIVE (Population of client’s region)**
+
+**Why predictive:** Clients from less developed or rural areas may face limited job opportunities, increasing default likelihood.
+
+**17. CNT_FAM_MEMBERS (Number of family members)**
+
+**Why predictive:** Larger households have greater financial strain, potentially reducing repayment capacity.
+
+**18. NAME_CONTRACT_TYPE (Cash loan vs revolving)**
+
+**Why predictive:** Revolving loans (like credit cards) typically carry higher default risk compared to installment loans.
+
+**19. OCCUPATION_TYPE (Client’s job type)**
+
+**Why predictive:** Certain occupations are higher risk (e.g., low-skilled jobs) due to income volatility.
+
+**20. ORGANIZATION_TYPE (Employer type)**
+
+**Why predictive:** Stability of employer matters—working for government or large firms may reduce risk compared to small or informal businesses.
+
+👉 These variables reflect **capacity** (income, annuity, credit amount), **stability** (employment length, age, residence duration), **assets** (realty/car ownership), and **demographics** (family, children, education). Together, they are likely to provide the best semantic predictors of default risk.
+
+## [My Critique:]{.underline}
+
+The AI-informed feature list demonstrates a strong understanding of credit risk drivers. It correctly emphasizes key capacity measures (income, credit amount, annuity), stability factors (employment length, age, residence duration), asset ownership (realty and car), and demographic pressures (children, family size, marital status). These variables are all highly plausible predictors of loan default.
+
+The list also includes REGION_POPULATION_RELATIVE, which may act as a socioeconomic proxy for risk but is less directly interpretable than features like income or employment. This is an interesting addition that could be valuable if its signal is not redundant with other features.
+
+One limitation of the AI reasoning is that it did not highlight the EXT_SOURCE variables (external credit scores), which are designed to predict default and will likely be strong predictors of the target. This may reflect the AI's focus on semantic meaning rather than statistical evidence.
+
+Overall, the AI’s list aligns well with domain expertise and covers the core predictors one would expect in a credit risk model.
+
+## Data-Informed Exploration
+
+```{r}
+# Numeric feature exploration
+numeric_vars <- c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", 
+                  "AMT_GOODS_PRICE")
+
+for (var in numeric_vars) {
+  p <- ggplot(app_train, aes(x = factor(TARGET), y = get(var), fill = factor(TARGET))) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_y_continuous(limits = c(0, quantile(app_train[[var]], 0.95, na.rm = TRUE))) +
+    labs(title = paste("Distribution of", var, "by TARGET"),
+         x = "TARGET (0 = Repaid, 1 = Default)", y = var) +
+    theme_minimal()
+  print(p)
+}
+```
+
+```{r}
+# Example categorical features
+categorical_vars <- c("NAME_CONTRACT_TYPE", "CODE_GENDER", "NAME_EDUCATION_TYPE", 
+                      "NAME_FAMILY_STATUS", "OCCUPATION_TYPE")
+
+for (var in categorical_vars) {
+  summary_df <- app_train %>%
+    group_by_at(var) %>%
+    summarise(
+      Default_Rate = mean(TARGET, na.rm = TRUE),
+      Count = n()
+    ) %>%
+    arrange(desc(Default_Rate))%>%
+  head(5)
+  
+  print(summary_df)
+  
+  p <- ggplot(app_train, aes_string(x = var, fill = "factor(TARGET)")) +
+    geom_bar(position = "fill") +
+    labs(title = paste("Default Rate by", var),
+         x = var, y = "Proportion") +
+    scale_y_continuous(labels = scales::percent) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  print(p)
+}
+```
+
+## Comparative Analysis of Feature Lists
+
+| **AI-Informed Features** | **Overlap** | **Data-Informed Features** |
+|--------------------------|------------------|----------------------------|
+| AMT_INCOME_TOTAL | ✅ | AMT_INCOME_TOTAL |
+| AMT_CREDIT | ✅ | AMT_CREDIT |
+| AMT_ANNUITY | ✅ | AMT_ANNUITY |
+| AMT_GOODS_PRICE | ✅ | AMT_GOODS_PRICE |
+| CNT_CHILDREN | ✅ | CNT_CHILDREN |
+| DAYS_BIRTH | ✅ | DAYS_BIRTH |
+| DAYS_EMPLOYED | ✅ | DAYS_EMPLOYED |
+| NAME_INCOME_TYPE | ✅ | NAME_INCOME_TYPE |
+| NAME_EDUCATION_TYPE | ✅ | NAME_EDUCATION_TYPE |
+| NAME_FAMILY_STATUS | ✅ | NAME_FAMILY_STATUS |
+| NAME_HOUSING_TYPE | ✅ | NAME_HOUSING_TYPE |
+| FLAG_OWN_REALTY | ✅ | FLAG_OWN_REALTY |
+| FLAG_OWN_CAR | ✅ | FLAG_OWN_CAR |
+| DAYS_REGISTRATION | ✅ | DAYS_REGISTRATION |
+| DAYS_ID_PUBLISH | ✅ | DAYS_ID_PUBLISH |
+| CNT_FAM_MEMBERS | ✅ | CNT_FAM_MEMBERS |
+| NAME_CONTRACT_TYPE | ✅ | NAME_CONTRACT_TYPE |
+| OCCUPATION_TYPE | ✅ | OCCUPATION_TYPE |
+| ORGANIZATION_TYPE | ✅ | ORGANIZATION_TYPE |
+| REGION_POPULATION_RELATIVE |  |  |
+|  | **EXT_SOURCE_1** | EXT_SOURCE_1 |
+|  | **EXT_SOURCE_2** | EXT_SOURCE_2 |
+|  | **EXT_SOURCE_3** | EXT_SOURCE_3 |
+|  |  | Bureau-derived features (e.g., NUM_BUREAU_LOANS, MAX_OVERDUE_DAYS) |
+
+### Discussion
+
+The AI-informed and data-informed lists had a lot of overlap, especially for things like income, loan size, monthly payments, age, employment, and family situation. The AI list included REGION_POPULATION_RELATIVE, which may or may not be useful in practice. The data-driven analysis pointed out other strong predictors, like the EXT_SOURCE credit scores and past-loan history from the bureau data. Overall, the AI’s list lined up well with the data on the basics, but the deeper analysis showed a few extra features that seem even more powerful.
+
+# Exploring Missing Data
+
+```{r}
+library(skimr)
+library(janitor)
+
+# Quick skim to see missingness and data types
+skim(app_train)
+
+# Percent missing by column
+missing_summary <- app_train %>%
+  janitor::tabyl(TARGET) %>%
+  head(10)
+
+missing_cols <- app_train %>%
+  summarise_all(~ mean(is.na(.))) %>%
+  gather(key = "variable", value = "missing_pct") %>%
+  arrange(desc(missing_pct)) %>%
+  head(10)
+
+head(missing_cols, 10)
+```
+
+## Check for Data Problems
+
+```{r}
+# Check unusual or impossible values
+summary(app_train$DAYS_EMPLOYED)
+table(app_train$CODE_GENDER)
+table(app_train$CNT_CHILDREN)
+
+# Example: DAYS_EMPLOYED has 365243 (a placeholder for missing)
+app_train %>%
+  filter(DAYS_EMPLOYED > 100000) %>%
+  nrow()
+```
+
+Several variables in the dataset contain substantial missing values, including external source scores and employment-related fields. In some cases, placeholders (such as DAYS_EMPLOYED = 365243) represent missing data and must be recoded.
+
+# Join with Transactional Data
+
+```{r}
+bureau <- fread("bureau.csv")
+
+# Aggregate bureau to the same grain (SK_ID_CURR level)
+bureau_agg <- bureau %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    NUM_BUREAU_LOANS = n(),
+    AVG_BUREAU_DAYS_CREDIT = mean(DAYS_CREDIT, na.rm = TRUE),
+    MAX_OVERDUE_DAYS = max(CREDIT_DAY_OVERDUE, na.rm = TRUE),
+    NUM_ACTIVE_LOANS = sum(CREDIT_ACTIVE == "Active", na.rm = TRUE)
+  )
+
+# Join back to application_train
+app_bureau <- app_train %>%
+  left_join(bureau_agg, by = "SK_ID_CURR")
+
+# Quick check of predictive potential
+app_bureau %>%
+  group_by(TARGET) %>%
+  summarise(
+    avg_loans = mean(NUM_BUREAU_LOANS, na.rm = TRUE),
+    avg_days_credit = mean(AVG_BUREAU_DAYS_CREDIT, na.rm = TRUE),
+    active_loans = mean(NUM_ACTIVE_LOANS, na.rm = TRUE)
+  )
+```
+
+# Results & Reflection
+
+EDA revealed a highly imbalanced target variable, confirming that accuracy alone is not an appropriate evaluation metric. Key predictors include applicant income, loan size, annuity, age, education, occupation, and especially the external credit score features (EXT_SOURCE). The AI-informed feature list overlapped strongly with the data-driven list, but statistical analysis emphasized EXT_SOURCE variables and transactional aggregates from bureau.csv as particularly promising. Data quality issues such as missing values and placeholders were found, meaning there is a need for careful preprocessing before modeling.
+
+Working through this EDA gave me a much better understanding of the dataset and what makes predicting default so challenging. I was surprised by how much imbalance there was in the target variable and how strong the external credit scores looked compared to the other features. At the same time, I found it interesting that more everyday details like education, occupation, and family status still showed clear patterns in default risk. Seeing missing values and strange placeholders also made me think more carefully about how messy real data could be. Overall, this process helped me see not just which features might be predictive, but also the importance of careful data preparation before modeling.

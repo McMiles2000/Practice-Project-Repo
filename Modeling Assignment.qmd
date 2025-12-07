@@ -1,0 +1,333 @@
+---
+title: "Modeling Assignment"
+author: "Miles McCunniff"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  include: false
+  eval: false
+  message: false
+  warning: false
+---
+
+# Setup & Data Prep
+
+```{r}
+# --- Libraries ---
+library(tidyverse)
+library(caret)
+library(ROCR)
+library(pROC)
+library(data.table)
+
+# --- Load Data ---
+train <- fread("application_train.csv")
+
+# --- Inspect Target Variable ---
+table(train$TARGET)
+prop.table(table(train$TARGET)) # Check class imbalance
+
+# --- Basic Cleaning ---
+# Remove ID column
+train <- train %>% select(-SK_ID_CURR)
+
+# Convert character/factor columns appropriately
+train <- train %>%
+  mutate_if(is.character, as.factor)
+
+# --- Helper function for categorical mode ---
+get_mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# --- Handle Missing Values (median/mode imputation) ---
+for (col in names(train)) {
+  if (is.numeric(train[[col]])) {
+    train[[col]][is.na(train[[col]])] <- median(train[[col]], na.rm = TRUE)
+  } else {
+    train[[col]][is.na(train[[col]])] <- get_mode(train[[col]])
+  }
+}
+
+# --- Train / Validation Split ---
+set.seed(123)
+trainIndex <- createDataPartition(train$TARGET, p = 0.8, list = FALSE)
+train_data <- train[trainIndex, ]
+valid_data <- train[-trainIndex, ]
+
+# --- Confirm Split ---
+prop.table(table(train_data$TARGET))
+prop.table(table(valid_data$TARGET))
+```
+
+# Benchmark Model - Majority Class Classifier
+
+```{r}
+# --- Benchmark Model: Majority Class ---
+# Predict the majority class (0) for all observations
+valid_data$pred_majority <- 0
+
+# --- Evaluate Benchmark ---
+# Confusion Matrix
+conf_matrix <- table(Predicted = valid_data$pred_majority, Actual = valid_data$TARGET)
+conf_matrix
+
+# Accuracy
+benchmark_acc <- mean(valid_data$pred_majority == valid_data$TARGET)
+benchmark_acc
+
+# AUC (should be 0.5)
+benchmark_auc <- roc(valid_data$TARGET, valid_data$pred_majority)$auc
+benchmark_auc
+
+# Summarize
+cat("Benchmark Accuracy:", round(benchmark_acc, 4), "\n")
+cat("Benchmark AUC:", round(benchmark_auc, 4), "\n")
+```
+
+# Logistic Regression Models
+
+```{r}
+# --- Simple Logistic Regression ---
+logit_simple <- glm(TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+                      EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+                    data = train_data, family = binomial)
+
+summary(logit_simple)
+
+# --- Predict on validation ---
+valid_data$pred_logit_simple <- predict(logit_simple, newdata = valid_data, type = "response")
+
+# --- Evaluate ---
+roc_simple <- roc(valid_data$TARGET, valid_data$pred_logit_simple)
+auc_simple <- auc(roc_simple)
+cat("Simple Logistic Regression AUC:", round(auc_simple, 4), "\n")
+
+# --- Optional Plot ---
+plot(roc_simple, col = "blue", main = "ROC Curve - Simple Logistic Regression")
+```
+
+```{r}
+# Add interaction between EXT_SOURCE_2 and EXT_SOURCE_3, plus a ratio
+train_data <- train_data %>%
+  mutate(CREDIT_INCOME_RATIO = AMT_CREDIT / (AMT_INCOME_TOTAL + 1))
+
+valid_data <- valid_data %>%
+  mutate(CREDIT_INCOME_RATIO = AMT_CREDIT / (AMT_INCOME_TOTAL + 1))
+
+logit_interact <- glm(TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+                        EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3 +
+                        CREDIT_INCOME_RATIO + EXT_SOURCE_2:EXT_SOURCE_3,
+                      data = train_data, family = binomial)
+
+valid_data$pred_logit_interact <- predict(logit_interact, newdata = valid_data, type = "response")
+
+roc_interact <- roc(valid_data$TARGET, valid_data$pred_logit_interact)
+auc_interact <- auc(roc_interact)
+cat("Interaction Logistic Regression AUC:", round(auc_interact, 4), "\n")
+```
+
+# Cross Validation
+
+```{r}
+# Cross-validation setup
+set.seed(123)
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = TRUE
+)
+
+# Recode target for caret
+train_data$TARGET <- factor(ifelse(train_data$TARGET == 1, "Yes", "No"), levels = c("No", "Yes"))
+
+# Fit Logistic Regression with CV
+cv_logit <- train(
+  TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+    EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+  data = train_data,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+cv_logit
+```
+
+# Random Forest
+
+```{r}
+library(randomForest)
+
+set.seed(123)
+rf_model <- randomForest(
+  TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+    EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+  data = train_data,
+  ntree = 200,
+  mtry = 3,
+  importance = TRUE
+)
+
+# Evaluate on validation
+valid_data$pred_rf <- predict(rf_model, newdata = valid_data, type = "prob")[, "Yes"]
+roc_rf <- roc(valid_data$TARGET, valid_data$pred_rf)
+auc_rf <- auc(roc_rf)
+cat("Random Forest AUC:", round(auc_rf, 4), "\n")
+
+# Variable Importance
+varImpPlot(rf_model)
+```
+
+# Gradient Boosting
+
+```{r}
+library(xgboost)
+library(pROC)
+
+# Prepare data matrices
+x_train <- model.matrix(TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+                          EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+                        data = train_data)[, -1]
+y_train <- ifelse(train_data$TARGET == "Yes", 1, 0)
+
+x_valid <- model.matrix(TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+                          EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+                        data = valid_data)[, -1]
+y_valid <- ifelse(valid_data$TARGET == 1, 1, 0)
+
+# XGBoost model
+set.seed(123)
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dvalid <- xgb.DMatrix(data = x_valid, label = y_valid)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(val = dvalid),
+  verbose = 0
+)
+
+# Evaluate
+pred_xgb <- predict(xgb_model, dvalid)
+auc_xgb <- auc(y_valid, pred_xgb)
+cat("XGBoost AUC:", round(auc_xgb, 4), "\n")
+
+# Feature Importance
+importance <- xgb.importance(model = xgb_model)
+xgb.plot.importance(importance, top_n = 10)
+```
+
+# Address Class Imbalance
+
+```{r}
+set.seed(123)
+ctrl_balance <- trainControl(
+  method = "cv",
+  number = 3,                # 3-fold CV (instead of 5)
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  sampling = "up",
+  verboseIter = FALSE
+)
+
+grid_small <- expand.grid(
+  nrounds = 100,
+  max_depth = 4,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+xgb_fast <- train(
+  TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+            EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3,
+  data = train_data,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = ctrl_balance,
+  tuneGrid = grid_small
+)
+
+xgb_fast
+```
+
+# Missingness
+
+```{r}
+# Reload the raw dataset just to inspect missingness
+raw_train <- data.table::fread("application_train.csv")
+
+# Check which columns had the most missing data originally
+colSums(is.na(raw_train)) %>%
+  sort(decreasing = TRUE) %>%
+  head(15)
+```
+
+
+
+```{r}
+train_data <- train_data %>%
+  mutate(
+    M_EXT_SOURCE_1 = ifelse(is.na(EXT_SOURCE_1), 1, 0),
+    M_EXT_SOURCE_2 = ifelse(is.na(EXT_SOURCE_2), 1, 0),
+    M_EXT_SOURCE_3 = ifelse(is.na(EXT_SOURCE_3), 1, 0),
+    M_HOUSING_INFO = ifelse(is.na(COMMONAREA_AVG), 1, 0)
+  )
+
+valid_data <- valid_data %>%
+  mutate(
+    M_EXT_SOURCE_1 = ifelse(is.na(EXT_SOURCE_1), 1, 0),
+    M_EXT_SOURCE_2 = ifelse(is.na(EXT_SOURCE_2), 1, 0),
+    M_EXT_SOURCE_3 = ifelse(is.na(EXT_SOURCE_3), 1, 0),
+    M_HOUSING_INFO = ifelse(is.na(COMMONAREA_AVG), 1, 0)
+  )
+```
+
+
+
+```{r}
+logit_missing <- glm(
+  TARGET ~ AMT_INCOME_TOTAL + AMT_CREDIT + DAYS_EMPLOYED +
+    EXT_SOURCE_1 + EXT_SOURCE_2 + EXT_SOURCE_3 +
+    M_EXT_SOURCE_1 + M_EXT_SOURCE_2 + M_EXT_SOURCE_3 + M_HOUSING_INFO,
+  data = train_data,
+  family = binomial
+)
+
+valid_data$pred_logit_missing <- predict(logit_missing, newdata = valid_data, type = "response")
+roc_missing <- pROC::roc(valid_data$TARGET, valid_data$pred_logit_missing)
+auc_missing <- pROC::auc(roc_missing)
+cat("AUC with Missingness Indicators:", round(auc_missing, 4), "\n")
+
+library(ggplot2)
+
+ggplot(raw_train, aes(x = as.factor(is.na(EXT_SOURCE_3)), fill = as.factor(TARGET))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Default Rate by Missing EXT_SOURCE_3",
+    x = "EXT_SOURCE_3 Missing (1 = Missing)",
+    y = "Proportion of Defaults"
+  )
+```
+
